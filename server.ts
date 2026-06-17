@@ -9,10 +9,32 @@ import mongoose from "mongoose";
 import connectDB from "./config/db.ts";
 import Article from "./models/article.ts";
 import { pipeline } from "@xenova/transformers";
+import { validateEnvironment, logEnvironmentConfig } from "./config/env.ts";
+import {
+  validateQueryRequest,
+  validateContentType,
+  formatErrorResponse,
+} from "./middleware/validation.ts";
+import { errorHandler, notFoundHandler } from "./middleware/errorHandler.ts";
+import type {
+  ConstitutionalArticle,
+  QueryTag,
+  RetrievalResult,
+  StructuredGuidanceResponse,
+  SuggestedAction,
+  EscalationOption,
+  EnvironmentConfig,
+} from "./types/index.ts";
 
-let cachedArticles: any[] = [];
-let embedder: any;
+// ============================================
+// Environment Configuration & Validation
+// ============================================
+const config = validateEnvironment();
+logEnvironmentConfig(config);
 
+// ============================================
+// OpenRouter Types
+// ============================================
 type OpenRouterError = {
   code?: number;
   message?: string;
@@ -31,32 +53,29 @@ type OpenRouterResponse = {
   [key: string]: unknown;
 };
 
-type QueryTag =
-  | "criminal_procedure_arrest"
-  | "speech_expression"
-  | "equality_discrimination"
-  | "general";
+// ============================================
+// Initialize Database & App
+// ============================================
+await connectDB();
 
-type RetrievalResult = {
-  articles: any[];
-  queryTag: QueryTag;
-  legalGrounding: string;
-};
-
-connectDB();
+let cachedArticles: ConstitutionalArticle[] = [];
+let embedder: any;
 
 const loadArticles = async () => {
   console.log("Loading articles...");
   cachedArticles = await Article.find();
-  console.log(`Loaded ${cachedArticles.length} articles`);
+  console.log(`✅ Loaded ${cachedArticles.length} articles`);
 };
 await loadArticles();
 
 const app = express();
-const PORT = Number(process.env.PORT || process.env.API_PORT) || 5000;
 
-app.use(cors());
-app.use(express.json());
+// ============================================
+// Middleware Configuration
+// ============================================
+app.use(cors({ origin: config.viteApiUrl, credentials: true }));
+app.use(express.json({ limit: "10mb" }));
+app.use(validateContentType);
 
 const LegalQuerySchema = new mongoose.Schema({
   question: String,
@@ -648,13 +667,9 @@ Respectfully,
   };
 };
 
-app.post("/api/query", async (req: Request, res: Response) => {
+app.post("/api/query", validateQueryRequest, async (req: Request, res: Response) => {
   try {
     const { question, userConsent = false } = req.body;
-
-    if (!question) {
-      return res.status(400).json({ error: "Question required" });
-    }
 
     const { articles, queryTag, legalGrounding } = await searchArticles(question);
     const aiResponse = await callAI(question, articles, queryTag, legalGrounding);
@@ -675,8 +690,8 @@ app.post("/api/query", async (req: Request, res: Response) => {
 
     res.json(aiResponse);
   } catch (err) {
-    console.error("Error:", err);
-    res.status(500).json({ error: "Server error", message: err instanceof Error ? err.message : "Unknown error" });
+    console.error("Query error:", err);
+    res.status(500).json(formatErrorResponse(err));
   }
 });
 
@@ -685,24 +700,33 @@ app.get("/api/queries", async (_, res) => {
   res.json(data);
 });
 
-app.get("/", (_, res) => {
-  res.send("Backend running");
+app.get("/", (_req: Request, res: Response) => {
+  res.json({ success: true, message: "Backend running", version: "1.0.0" });
 });
 
+// ============================================
+// Error Handling Middleware (must be last)
+// ============================================
+app.use(notFoundHandler);
+app.use(errorHandler);
+
+// ============================================
+// Server Startup
+// ============================================
 const startServer = (port: number) => {
   const server = app.listen(port, () => {
-    console.log(`Server running on http://localhost:${port}`);
+    console.log(`✅ Server running on http://localhost:${port}`);
   });
 
   server.on("error", (error: NodeJS.ErrnoException) => {
     if (error.code === "EADDRINUSE") {
       console.error(
-        `Port ${port} is already in use. Stop the existing server process and restart.`
+        `❌ Port ${port} is already in use. Stop the existing server process and restart.`
       );
-      return;
+      process.exit(1);
     }
     throw error;
   });
 };
 
-startServer(PORT);
+startServer(config.port);
